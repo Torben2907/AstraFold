@@ -33,6 +33,11 @@ def _onehot(sequence: str = SEQUENCE) -> torch.Tensor:
 
 def _hybrid(flow_module, model=None, seeds=(0,), **kwargs):
     kwargs.setdefault("num_timesteps", NUM_TIMESTEPS)
+    # The tests follow the pseudocode (one token per round, all tokens remasked),
+    # not the tuned defaults.
+    kwargs.setdefault("confidence_tolerance", 0.1)
+    kwargs.setdefault("tokens_per_round", 1)
+    kwargs.setdefault("remask_fraction", 1.0)
     return sample_hybrid(
         flow_module.interpolant,
         model if model is not None else flow_module.model,

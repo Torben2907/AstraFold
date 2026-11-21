@@ -49,9 +49,9 @@ def sample_hybrid(
     onehot: Tensor,
     seeds: list[int],
     num_timesteps: int | None = None,
-    confidence_tolerance: float = 0.1,
-    tokens_per_round: int = 1,
-    remask_fraction: float = 1.0,
+    confidence_tolerance: float = 0.2,
+    tokens_per_round: int = 8,
+    remask_fraction: float = 0.25,
 ) -> dict[str, Tensor]:
     """
     Generates one structure per seed for a single sequence with the hybrid sampler

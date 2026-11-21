@@ -212,11 +212,11 @@ class HybridSamplerConfig:
     """Options of the hybrid sampler (astrafold/data/hybrid_sampler.py)."""
 
     # eps: a contact token is revealed once its probability is >= 1 - eps.
-    confidence_tolerance: float = 0.1
+    confidence_tolerance: float = 0.2
     # Most tokens revealed per trajectory; 1 reveals one token per restart.
-    tokens_per_round: int = 1
+    tokens_per_round: int = 8
     # Share of the tokens remasked for the self-consistency score.
-    remask_fraction: float = 1.0
+    remask_fraction: float = 0.25
 
 
 @dataclass

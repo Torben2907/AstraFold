@@ -9,7 +9,7 @@ Two alignments per prediction and native:
   - `tm_align`, `rmsd_align`: US-align's default sequence-independent alignment.
 US-align uses the C3' atoms of RNA (the metrics of compare_samplers use C1').
 
-    python3 scripts/usalign_eval.py --out results/casp15_ft [--usalign PATH]
+    python3 scripts/usalign_eval.py --out results/casp15 [--usalign PATH]
 
 Writes <out>/usalign.csv (one row per sample and native) and
 <out>/usalign_summary.md. The first native of a target (by file name) is the

@@ -134,8 +134,9 @@ def _cost(length: int, sampler: str, args) -> float:
     if sampler == "flow":
         calls = args.num_timesteps or FLOW_CALLS
     else:
-        eps = float(sampler.removeprefix("hybrid_eps"))
-        calls = 0.84 / eps * length
+        cfg = _parse_hybrid_name(sampler)
+        # restarts shrink about proportionally with the tokens revealed per round
+        calls = 0.84 / cfg.confidence_tolerance * length / cfg.tokens_per_round
     return calls * length**2
 
 
@@ -160,15 +161,45 @@ def _score(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> tuple:
     return rmsd, tm_score(pred[mask], gt[mask]), lddt(pred[mask], gt[mask])
 
 
+def _hybrid_name(cfg: HybridSamplerConfig) -> str:
+    """hybrid_eps<eps>[_tpr<tokens per round>][_rm<remask fraction>]; the suffixes
+    are left out at their defaults (1 and 1.0), so older result names still parse."""
+    name = f"hybrid_eps{cfg.confidence_tolerance:g}"
+    if cfg.tokens_per_round != 1:
+        name += f"_tpr{cfg.tokens_per_round}"
+    if cfg.remask_fraction != 1.0:
+        name += f"_rm{cfg.remask_fraction:g}"
+    return name
+
+
+def _parse_hybrid_name(name: str) -> HybridSamplerConfig:
+    fields = {"eps": 0.1, "tpr": 1, "rm": 1.0}
+    for part in name.removeprefix("hybrid_").split("_"):
+        key = part.rstrip("0123456789.e-")
+        fields[key] = type(fields[key])(part[len(key) :])
+    return HybridSamplerConfig(fields["eps"], fields["tpr"], fields["rm"])
+
+
 def _sampler_specs(args) -> dict[str, tuple[str, HybridSamplerConfig | None]]:
-    """Sampler variants by name: flow, and one hybrid per confidence tolerance."""
+    """
+    Sampler variants by name: flow, one hybrid per confidence tolerance (with the
+    shared --tokens-per-round and --remask-fraction), and one per --hybrid-configs
+    entry EPS:TOKENS_PER_ROUND:REMASK_FRACTION.
+    """
     specs: dict[str, tuple[str, HybridSamplerConfig | None]] = {}
     if "flow" in args.samplers:
         specs["flow"] = ("flow", None)
+    configs = []
     if "hybrid" in args.samplers:
-        for eps in args.hybrid_eps:
-            cfg = HybridSamplerConfig(eps, args.tokens_per_round, args.remask_fraction)
-            specs[f"hybrid_eps{eps:g}"] = ("hybrid", cfg)
+        configs += [
+            HybridSamplerConfig(eps, args.tokens_per_round, args.remask_fraction)
+            for eps in args.hybrid_eps
+        ]
+    for entry in args.hybrid_configs:
+        eps, tpr, rm = entry.split(":")
+        configs.append(HybridSamplerConfig(float(eps), int(tpr), float(rm)))
+    for cfg in configs:
+        specs[_hybrid_name(cfg)] = ("hybrid", cfg)
     return specs
 
 
@@ -468,9 +499,17 @@ def main() -> None:
         help="write <out>/structures/<sampler>/<target>/Sample_<seed>.pdb",
     )
     p_run.add_argument("--samplers", nargs="+", default=["flow", "hybrid"])
-    p_run.add_argument("--hybrid-eps", type=float, nargs="+", default=[0.1])
-    p_run.add_argument("--tokens-per-round", type=int, default=1)
-    p_run.add_argument("--remask-fraction", type=float, default=1.0)
+    p_run.add_argument("--hybrid-eps", type=float, nargs="+", default=[0.2])
+    p_run.add_argument("--tokens-per-round", type=int, default=8)
+    p_run.add_argument("--remask-fraction", type=float, default=0.25)
+    p_run.add_argument(
+        "--hybrid-configs",
+        nargs="+",
+        default=[],
+        metavar="EPS:TPR:RM",
+        help="extra hybrid variants: confidence tolerance, tokens per round and "
+        "remask fraction, e.g. 0.2:8:0.5",
+    )
     p_run.add_argument("--num-samples", type=int, default=5)
     p_run.add_argument("--num-timesteps", type=int, default=None)
     p_run.add_argument("--seed", type=int, default=0)
