@@ -100,6 +100,8 @@ def _csv_examples(dataset: PDBNABaseDataset, indices: list[int]) -> dict[int, Ex
         examples[idx] = Example(
             name=dataset.csv.iloc[idx]["pdb_name"],
             sequence="".join(rc.restypes[a] for a in example["aatype"].tolist()),
+            # The backbone frame origins (trans_1) are the C1' atoms, so these are
+            # the same atoms as the scored predictions and the FASTA natives.
             natives=[
                 (example["trans_1"].numpy(), example["res_mask"].bool().numpy())
             ],
