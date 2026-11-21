@@ -9,7 +9,7 @@ import torch
 from torch import Tensor, nn
 
 from astrafold.config.hydra_schema import NodeEmbedderConfig
-from astrafold.data.contacts import NUM_TOKEN_STATES
+from astrafold.data.base_pairs import NUM_NODE_STATES, node_states
 from astrafold.models import utils
 
 
@@ -20,9 +20,10 @@ class NodeEmbedder(nn.Module):
         self.c_s = self._cfg.c_s
         self.c_pos_emb = self._cfg.c_pos_emb
         self.c_timestep_emb = self._cfg.c_timestep_emb
-        self.token_embedding = nn.Embedding(NUM_TOKEN_STATES, module_cfg.c_token_emb)
+        # Base-pair token state of each nucleotide: masked, unpaired or paired.
+        self.token_embedding = nn.Embedding(NUM_NODE_STATES, module_cfg.c_token_emb)
 
-        # Position, timestep and contact token embeddings + the one-hot sequence (4)
+        # Position, timestep and token state embeddings + the one-hot sequence (4)
         self.linear = nn.Linear(
             self._cfg.c_pos_emb + self._cfg.c_timestep_emb + 4 + self._cfg.c_token_emb,
             self.c_s,
@@ -48,7 +49,7 @@ class NodeEmbedder(nn.Module):
         onehot = onehot.to(device)
         onehot = onehot * mask.unsqueeze(-1)
 
-        token_emb = self.token_embedding(tokens)
+        token_emb = self.token_embedding(node_states(tokens))
         token_emb = token_emb * mask.unsqueeze(-1)
 
         input_feats = [

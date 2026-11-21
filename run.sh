@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Trains (or finetunes) on one of the datasets, on the given GPUs. Output goes to trlog.txt.
+# Trains (or finetunes) on one of the datasets, on the given GPUs. Output goes to
+# trlog.txt (or --log FILE); checkpoints to ckpt/<train|Finetune>/<name>/, where the
+# name defaults to the dataset (--name NAME keeps runs apart).
 #
 #   ./run.sh --dataset {RNA3DB|CASP16|CASP15} --gpu 0,1,2,3 [--finetune --ckpt PATH]
 #   ./run.sh --dataset CASP15 --gpu 0,1,2,3 --resume ckpt/train/CASP15/last.ckpt
+#   ./run.sh --dataset CASP15 --gpu 0,2,3 --name CASP15_bp --log trlog_casp15_bp.txt
 set -euo pipefail
 ulimit -n 65000
 
@@ -10,6 +13,8 @@ DATASET=""
 GPU=""
 CKPT=""
 RESUME=""
+RUN_NAME=""
+LOG="trlog.txt"
 FINETUNE=false
 
 TRAIN_EPOCHS=1500
@@ -23,6 +28,8 @@ while [[ $# -gt 0 ]]; do
     --ckpt)     CKPT="$2"; shift 2 ;;
     --finetune) FINETUNE=true; shift ;;
     --resume)   RESUME="$2"; shift 2 ;;
+    --name)     RUN_NAME="$2"; shift 2 ;;
+    --log)      LOG="$2"; shift 2 ;;
     *) echo "Unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -62,6 +69,8 @@ case "$DATASET" in
     ;;
 esac
 
+[[ -n "$RUN_NAME" ]] && NAME="$RUN_NAME"
+
 NUM_DEVICES=$(awk -F',' '{print NF}' <<< "$GPU")
 
 MAX_EPOCHS="$TRAIN_EPOCHS"
@@ -87,4 +96,4 @@ else
   CMD+=(experiment.finetune=false experiment.warm_start=null)
 fi
 
-CUDA_VISIBLE_DEVICES="$GPU" "${CMD[@]}" > trlog.txt
+CUDA_VISIBLE_DEVICES="$GPU" "${CMD[@]}" > "$LOG"

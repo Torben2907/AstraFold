@@ -16,7 +16,7 @@ from torch import Tensor
 from astrafold.config.hydra_schema import InterpolantConfig
 from astrafold.data import so3_utils
 from astrafold.data import utils as du
-from astrafold.data.contacts import MASK, unmask_tokens
+from astrafold.data.base_pairs import MASK, reveal_tokens
 
 
 def _centered_gaussian(num_batch, num_res, device):
@@ -256,11 +256,13 @@ class Interpolant:
     ) -> dict[str, Tensor]:
         """
         Generates one structure per seed for a single sequence: integrates the frames
-        from noise (t = min_t) to data (t = 1) with Euler steps, while the contact
+        from noise (t = min_t) to data (t = 1) with Euler steps, while the base-pair
         tokens go from fully masked to fully revealed. In every step the model
         predicts the clean structure and the tokens; a masked token is then revealed
-        with probability d_t / (1 - t), so that on average a fraction 1 - t of the
-        tokens is masked at flow time t.
+        with probability d_t / (1 - t), its value drawn from the predicted partners
+        that are still masked (or unpaired). Revealing a pair also reveals the
+        partner's token, so slightly more than a fraction t of the tokens is revealed
+        at flow time t. All tokens are revealed in the last step.
 
         Each sample draws all its randomness from its own seed, so a sample does not
         depend on which other samples share its batch.
@@ -275,7 +277,8 @@ class Interpolant:
             trans          : [B, N, 3] frame origins (in Angstrom)
             rotmats        : [B, N, 3, 3] frame orientations
             torsions       : [B, N, 9, 2] torsion angles as (sin, cos)
-            contact_tokens : [B, N] the generated contact tokens
+            pair_tokens    : [B, N] the generated base-pair tokens (partner or
+                             UNPAIRED)
         """
         if num_timesteps is None:
             num_timesteps = self._sample_cfg.num_timesteps
@@ -301,7 +304,7 @@ class Interpolant:
         def predict(t: float) -> dict[str, Tensor]:
             batch["trans_t"] = trans_t
             batch["rotmats_t"] = rotmats_t
-            batch["contact_tokens"] = tokens
+            batch["pair_tokens"] = tokens
             batch["t"] = torch.full((num_batch, 1), t, device=device)
             return model(batch)
 
@@ -316,13 +319,16 @@ class Interpolant:
             trans_t, rotmats_t = self.euler_step(
                 d_t, t_1, model_out, trans_t, rotmats_t
             )
-            tokens = unmask_tokens(
+            # Reveals all remaining tokens in the last step (t_2 = 1).
+            reveal_noise = draw(lambda g: torch.rand(num_res, generator=g))
+            value_noise = draw(lambda g: torch.rand(num_res, generator=g))
+            probs = torch.softmax(model_out["token_logits"].float(), dim=-1)
+            tokens = reveal_tokens(
                 tokens,
-                model_out["token_logits"],
-                # Reveals all remaining tokens in the last step (t_2 = 1).
-                reveal_probability=d_t / (1 - t_1),
-                reveal_noise=draw(lambda g: torch.rand(num_res, generator=g)),
-                value_noise=draw(lambda g: torch.rand(num_res, generator=g)),
+                probs,
+                candidates=(tokens == MASK) & (reveal_noise < d_t / (1 - t_1)),
+                priority=probs.max(dim=-1).values,
+                value_noise=value_noise,
             )
             t_1 = t_2
 
@@ -333,5 +339,5 @@ class Interpolant:
             "trans": model_out["pred_trans"],
             "rotmats": model_out["pred_rotmats"],
             "torsions": model_out["pred_torsions"].reshape(num_batch, num_res, -1, 2),
-            "contact_tokens": tokens,
+            "pair_tokens": tokens,
         }

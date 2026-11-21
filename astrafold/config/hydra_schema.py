@@ -26,8 +26,6 @@ class DataConfig:
     eval_batch_size: int = MISSING
     num_workers: int = MISSING
     prefetch_factor: int = MISSING
-    contact_distance_threshold: float = MISSING
-    contact_minimum_sequence_separation: int = MISSING
 
 
 @dataclass
@@ -211,7 +209,7 @@ class HydraConfig:
 class HybridSamplerConfig:
     """Options of the hybrid sampler (astrafold/data/hybrid_sampler.py)."""
 
-    # eps: a contact token is revealed once its probability is >= 1 - eps.
+    # eps: a base-pair token is revealed once its probability is >= 1 - eps.
     confidence_tolerance: float = 0.2
     # Most tokens revealed per trajectory; 1 reveals one token per restart.
     tokens_per_round: int = 8

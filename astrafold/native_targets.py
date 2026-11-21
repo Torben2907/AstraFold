@@ -21,6 +21,8 @@ import gemmi
 import numpy as np
 from Bio import Align
 
+from astrafold.data import base_constants as rc
+from astrafold.data.base_pairs import annotate_base_pairs
 from astrafold.data.sequence import read_fasta
 
 NUCLEOTIDES = "ACGU"
@@ -38,6 +40,9 @@ class Native:
     residues: dict[int, tuple[int, str]] = field(repr=False)
     path: Path = field(repr=False)
     chain: str = ""
+    # [N] base-pair tokens of the native (partner index, or UNPAIRED), annotated
+    # like the training data (astrafold.data.base_pairs.annotate_base_pairs)
+    pair_tokens: np.ndarray = field(default=None, repr=False)
 
 
 @dataclass
@@ -83,6 +88,9 @@ def map_native(sequence: str, path: Path, min_identity: float = 0.9) -> Native:
     n = len(sequence)
     c1 = np.zeros((n, 3), dtype=np.float32)
     mask = np.zeros(n, dtype=bool)
+    # The atoms the base-pair annotation needs, in the atom28 layout.
+    atoms = np.zeros((n, len(rc.atom_types), 3), dtype=np.float32)
+    atom_mask = np.zeros((n, len(rc.atom_types)), dtype=bool)
     numbering: dict[int, tuple[int, str]] = {}
     identical = 0
     for (t_start, t_end), (n_start, _) in zip(*alignment.aligned, strict=True):
@@ -97,13 +105,19 @@ def map_native(sequence: str, path: Path, min_identity: float = 0.9) -> Native:
             c1[i] = (atom.pos.x, atom.pos.y, atom.pos.z)
             mask[i] = True
             numbering[i] = (residue.seqid.num, residue.seqid.icode)
+            for name in ("C1'", "N1", "N3"):
+                found = residue.find_atom(name, "*")
+                if found is not None:
+                    atoms[i, rc.atom_order[name]] = found.pos.tolist()
+                    atom_mask[i, rc.atom_order[name]] = True
 
     if identical < min_identity * len(native_seq):
         raise ValueError(
             f"{path}: only {identical}/{len(native_seq)} native residues match the "
             "target sequence"
         )
-    return Native(path.stem, c1, mask, numbering, path, chain.name)
+    pair_tokens = annotate_base_pairs(sequence, atoms, atom_mask)
+    return Native(path.stem, c1, mask, numbering, path, chain.name, pair_tokens)
 
 
 def find_native_files(natives_dir: Path, name: str) -> list[Path]:

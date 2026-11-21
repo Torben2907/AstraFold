@@ -89,3 +89,14 @@ def test_rna3db_test_natives_are_single_chain_mmcif() -> None:
     # the unknown first nucleotide (N) of 7k16_P is dropped from the sequence
     assert by_name["7k16_P"].natives[0].mask.all()
     assert len(by_name["7k16_P"].sequence) == 50
+
+
+@_casp15
+def test_native_base_pairs_are_annotated() -> None:
+    # R1107 is a 69-nt RNA with a well-formed secondary structure.
+    native = map_native(SEQUENCES["R1107"], find_native_files(NATIVES, "R1107")[0])
+    tokens = native.pair_tokens
+    paired = np.flatnonzero(tokens >= 0)
+    assert np.array_equal(tokens[tokens[paired]], paired)
+    assert native.mask[paired].all()
+    assert len(paired) >= 20

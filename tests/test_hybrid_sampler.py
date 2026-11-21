@@ -10,7 +10,7 @@ from astrafold.config.hydra_schema import (
     HydraConfig,
     InferenceConfig,
 )
-from astrafold.data.contacts import CONTACT, MASK, NO_CONTACT
+from astrafold.data.base_pairs import MASK, UNPAIRED, allowed_partners
 from astrafold.data.hybrid_sampler import sample_hybrid
 from astrafold.data.sequence import sequence_features
 from astrafold.inference import Sampler, run_inference
@@ -49,13 +49,21 @@ def _hybrid(flow_module, model=None, seeds=(0,), **kwargs):
 
 class Oracle:
     """
-    A stand-in model with fixed per-position token probabilities. Predicts
-    p(CONTACT) = p_contact[i] for every nucleotide i (and x1 = 0), and records the
-    inputs of every call.
+    A stand-in model with fixed per-position token probabilities. Nucleotide i is
+    unpaired with probability p_unpaired[i]; the rest goes to pairing with itself,
+    which is never available, so the confidence of i is p_unpaired[i]. `pairs`
+    {i: (j, p)} instead lets i pair with j with probability p. Predicts x1 = 0 and
+    records the inputs of every call.
     """
 
-    def __init__(self, p_contact: torch.Tensor):
-        self.logits = torch.stack([torch.log1p(-p_contact), torch.log(p_contact)], -1)
+    def __init__(self, p_unpaired: torch.Tensor, pairs: dict | None = None):
+        probs = torch.zeros(N, N + 1)
+        probs[:, N] = p_unpaired
+        probs[torch.arange(N), torch.arange(N)] = 1 - p_unpaired
+        for i, (j, p) in (pairs or {}).items():
+            probs[i] = 0.0
+            probs[i, j], probs[i, N] = p, 1 - p
+        self.logits = torch.log(probs)
         self.calls: list[dict[str, torch.Tensor]] = []
 
     def __call__(self, batch):
@@ -69,32 +77,37 @@ class Oracle:
         }
 
 
+def _assert_valid_secondary_structure(tokens: torch.Tensor) -> None:
+    assert torch.all((tokens == UNPAIRED) | (tokens >= 0))
+    allowed = allowed_partners(_onehot()[None], torch.ones(1, N))[0]
+    for row in tokens:
+        paired = torch.nonzero(row >= 0).squeeze(-1)
+        assert torch.equal(row[row[paired]], paired)
+        assert allowed[paired, row[paired]].all()
+
+
 def test_hybrid_shapes_and_tokens(flow_module):
     out = _hybrid(flow_module, seeds=[0, 1, 2])
     assert out["trans"].shape == (3, N, 3)
     assert out["rotmats"].shape == (3, N, 3, 3)
     assert out["torsions"].shape == (3, N, 9, 2)
-    for key in ("contact_tokens", "remask", "reveal_t", "reveal_round"):
+    for key in ("pair_tokens", "remask", "reveal_t", "reveal_round"):
         assert out[key].shape == (3, N), key
     for key in ("self_consistency", "num_forced", "num_model_calls"):
         assert out[key].shape == (3,), key
     for key in ("trans", "rotmats", "torsions", "self_consistency", "reveal_t"):
         assert torch.isfinite(out[key]).all(), key
 
-    tokens = out["contact_tokens"]
-    assert torch.all((tokens == CONTACT) | (tokens == NO_CONTACT))
+    _assert_valid_secondary_structure(out["pair_tokens"])
     assert torch.all(out["self_consistency"] <= 0)
-    # One token per round: the rounds are a permutation of 0..N-1.
-    assert torch.equal(
-        out["reveal_round"].sort(dim=-1).values, torch.arange(N).expand(3, N)
-    )
+    # Every token is revealed in some round; a pair reveals two at once.
+    assert torch.all(out["reveal_round"] >= 0)
 
 
 def test_confident_tokens_are_revealed_at_the_start_in_confidence_order(flow_module):
     # All tokens confident from the start: one model call per token, no Euler step.
-    p_contact = torch.linspace(0.95, 0.999, N)
-    p_contact[::2] = 1 - p_contact[::2]  # half of them confident NO_CONTACT
-    oracle = Oracle(p_contact)
+    p_unpaired = torch.linspace(0.95, 0.999, N)
+    oracle = Oracle(p_unpaired)
     out = _hybrid(flow_module, oracle, confidence_tolerance=0.1)
 
     min_t = flow_module.interpolant._cfg.min_t
@@ -102,15 +115,13 @@ def test_confident_tokens_are_revealed_at_the_start_in_confidence_order(flow_mod
     assert out["num_forced"].item() == 0
     assert out["num_model_calls"].item() == N + NUM_TIMESTEPS + 1
 
-    confidence = torch.maximum(p_contact, 1 - p_contact)
-    expected_order = confidence.argsort(descending=True)
+    expected_order = p_unpaired.argsort(descending=True)
     assert torch.equal(out["reveal_round"][0].argsort(), expected_order)
-    expected_tokens = torch.where(p_contact > 0.5, CONTACT, NO_CONTACT)
-    assert torch.equal(out["contact_tokens"][0], expected_tokens)
+    assert torch.all(out["pair_tokens"] == UNPAIRED)
 
     # Every round sees exactly one more revealed token than the round before.
     for i, call in enumerate(oracle.calls[:N]):
-        assert (call["contact_tokens"] != MASK).sum().item() == i
+        assert (call["pair_tokens"] != MASK).sum().item() == i
 
 
 def test_unconfident_tokens_run_to_the_end_and_are_forced(flow_module):
@@ -121,7 +132,21 @@ def test_unconfident_tokens_run_to_the_end_and_are_forced(flow_module):
     assert torch.allclose(out["reveal_t"], torch.ones(1, N))
     # N full trajectories, the final trajectory and the scoring call.
     assert out["num_model_calls"].item() == (N + 1) * NUM_TIMESTEPS + 1
-    assert torch.all(out["contact_tokens"] == CONTACT)
+    assert torch.all(out["pair_tokens"] == UNPAIRED)
+
+
+def test_a_revealed_pair_sets_both_tokens(flow_module):
+    # GGACUUCGGUCC: nucleotide 0 (G) confidently pairs with 11 (C).
+    oracle = Oracle(torch.full((N,), 0.6), pairs={0: (11, 0.99)})
+    out = _hybrid(flow_module, oracle, confidence_tolerance=0.1)
+
+    tokens = out["pair_tokens"][0]
+    assert tokens[0].item() == 11 and tokens[11].item() == 0
+    assert out["reveal_round"][0, 0] == out["reveal_round"][0, 11] == 0
+    assert out["num_forced"].item() == N - 2
+    # The second round sees the pair as a revealed pair.
+    second = oracle.calls[1]["pair_tokens"][0]
+    assert second[0].item() == 11 and second[11].item() == 0
 
 
 def test_every_trajectory_restarts_from_the_same_noise(flow_module):
@@ -140,9 +165,9 @@ def test_every_trajectory_restarts_from_the_same_noise(flow_module):
 
 
 def test_tokens_per_round_reveals_several_confident_tokens(flow_module):
-    p_contact = torch.full((N,), 0.6)
-    p_contact[:5] = 0.99  # five confident tokens, the rest not
-    out = _hybrid(flow_module, Oracle(p_contact), tokens_per_round=3)
+    p_unpaired = torch.full((N,), 0.6)
+    p_unpaired[:5] = 0.99  # five confident tokens, the rest not
+    out = _hybrid(flow_module, Oracle(p_unpaired), tokens_per_round=3)
 
     # Rounds: 3 confident, 2 confident, then the 7 others one by one (forced).
     assert out["reveal_round"][0, :5].sort().values.tolist() == [0, 0, 0, 1, 1]
@@ -151,18 +176,18 @@ def test_tokens_per_round_reveals_several_confident_tokens(flow_module):
 
 
 def test_self_consistency_of_a_confident_model(flow_module):
-    p_contact = torch.linspace(0.6, 0.99, N)
-    out = _hybrid(flow_module, Oracle(p_contact), remask_fraction=1.0)
-    # All tokens are CONTACT (p > 0.5), so the score is the sum of log p_contact.
+    p_unpaired = torch.linspace(0.6, 0.99, N)
+    out = _hybrid(flow_module, Oracle(p_unpaired), remask_fraction=1.0)
+    # All tokens are UNPAIRED, so the score is the sum of log p_unpaired.
     assert out["self_consistency"].item() == pytest.approx(
-        torch.log(p_contact).sum().item(), rel=1e-5
+        torch.log(p_unpaired).sum().item(), rel=1e-5
     )
 
-    out = _hybrid(flow_module, Oracle(p_contact), remask_fraction=0.25)
+    out = _hybrid(flow_module, Oracle(p_unpaired), remask_fraction=0.25)
     remask = out["remask"][0]
     assert remask.sum().item() == math.ceil(0.25 * N)
     assert out["self_consistency"].item() == pytest.approx(
-        torch.log(p_contact[remask]).sum().item(), rel=1e-5
+        torch.log(p_unpaired[remask]).sum().item(), rel=1e-5
     )
 
 
@@ -172,7 +197,7 @@ def test_scoring_call_sees_the_final_structure_and_remasked_tokens(flow_module):
     score_call = oracle.calls[-1]
     assert torch.all(score_call["t"] == 1.0)
     assert torch.equal(score_call["trans_t"], out["trans"])
-    assert torch.equal(score_call["contact_tokens"] == MASK, out["remask"])
+    assert torch.equal(score_call["pair_tokens"] == MASK, out["remask"])
 
 
 def test_hybrid_is_deterministic_and_independent_of_the_batch(flow_module):
@@ -183,7 +208,7 @@ def test_hybrid_is_deterministic_and_independent_of_the_batch(flow_module):
 
     alone = _hybrid(flow_module, seeds=[4])
     assert torch.allclose(first["trans"][1], alone["trans"][0], atol=1e-2)
-    assert torch.equal(first["contact_tokens"][1], alone["contact_tokens"][0])
+    assert torch.equal(first["pair_tokens"][1], alone["pair_tokens"][0])
     assert torch.equal(first["reveal_round"][1], alone["reveal_round"][0])
 
 

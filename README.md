@@ -4,8 +4,32 @@ Training and inference code for *"Bridging discrete and continuous diffusion mod
 RNA structure prediction"*.
 
 The model is an SE(3) flow matching network for RNA backbones. It takes the noisy
-nucleotide frames, the sequence and a partially masked set of per-nucleotide contact
-tokens, and predicts the clean structure together with the masked tokens.
+nucleotide frames, the sequence and a partially masked set of base-pair tokens, and
+predicts the clean structure together with the masked tokens. Each nucleotide's token
+is its base-pairing partner (or "unpaired"), so the tokens are the secondary
+structure; the model learns it from the sequence and the 3D context by predicting the
+masked tokens, without an external base-pair map.
+
+### Base-pair tokens
+
+`astrafold/data/base_pairs.py` defines the tokens:
+
+- **Labels.** The base pairs of a training structure are annotated from its 3D
+  coordinates: canonical pairs (A-U, G-C, G-U) at least 4 nucleotides apart, whose
+  C1' atoms are 9-12 Å apart and whose purine N1 is within 3.6 Å (5.0 Å for G-U) of
+  the pyrimidine N3, one partner per nucleotide. The same annotation gives the base
+  pairs of the benchmark natives.
+- **Input.** The model sees each nucleotide's state (masked, unpaired or paired) and,
+  as a pair feature, the revealed pairs.
+- **Output.** For every nucleotide a distribution over its N possible partners plus
+  "unpaired", scored from the pair representation. Pairs that are not canonical or
+  too close in sequence are excluded.
+- **Sampling.** All tokens start masked. A revealed token takes a partner that is
+  still masked (or "unpaired"), and the partner's token is set too, so the tokens
+  always form a valid secondary structure.
+
+Checkpoints trained with the earlier per-nucleotide contact tokens are not compatible
+with this model.
 
 The repository covers:
 
@@ -181,15 +205,15 @@ Inference runs on a GPU if one is available and also works on the CPU, only slow
 | `output_format` | `pdb` | `pdb`, `mmcif` or `both` |
 | `device` | `auto` | `auto` (GPU if available), `cpu`, `cuda` or `cuda:<id>` |
 
-The sampler starts from random frames and fully masked contact tokens. It integrates
+The sampler starts from random frames and fully masked base-pair tokens. It integrates
 the frames from noise to data with Euler steps; in every step the model also predicts
-the contact tokens, and a share of the masked ones is revealed, so that all tokens are
-known when the flow reaches the data.
+the base-pair tokens, and a share of the masked ones is revealed, so that all tokens
+are known when the flow reaches the data.
 
 ### Hybrid sampler
 
 `sampler=hybrid` synchronizes the discrete tokens with the continuous flow
-(`astrafold/data/hybrid_sampler.py`). It reveals the contact tokens a few at a time
+(`astrafold/data/hybrid_sampler.py`). It reveals the base-pair tokens a few at a time
 (the most confident ones) and restarts the flow from the same initial noise after
 every reveal:
 
@@ -290,7 +314,7 @@ overrides them.
 
 | Group | Configures |
 | --- | --- |
-| `data/` | Metadata CSVs, length filter, batch sizes, contact tokens |
+| `data/` | Metadata CSVs, length filter, batch sizes |
 | `interpolant/` | Noise schedules of the flow |
 | `model/` | Network architecture |
 | `training/` | Loss weights and token masking |
@@ -333,7 +357,7 @@ benchmarks/RNA3DB/              RNA3DB test sequences (natives: downloaded, not 
 astrafold/                      the Python package
   config/                       typed config schema
   data/                         dataset, batching, interpolant (noising and sampling),
-                                hybrid sampler, contact tokens, sequence features,
+                                hybrid sampler, base-pair tokens, sequence features,
                                 PDB/mmCIF output
   models/                       network (flow_model.py) and Lightning module (flow_module.py)
   inference.py                  sampler that turns a checkpoint and a sequence into structures

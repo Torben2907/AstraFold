@@ -73,7 +73,8 @@ class Sampler:
                              atom order of base_constants.atom_types
             atom_mask      : [N, 28] 1 where the residue has that atom
             aatype         : [N] residue type index into base_constants.restypes
-            contact_tokens : [len(seeds), N] generated contact tokens (1 = contact)
+            pair_tokens    : [len(seeds), N] generated base-pair tokens (partner
+                             index, or -1 = unpaired)
 
         The hybrid sampler adds `self_consistency`, `reveal_t`, `reveal_round`,
         `num_forced` and `num_model_calls` (see `sample_hybrid`).
@@ -120,7 +121,7 @@ class Sampler:
 
 # Per-sample outputs of the samplers that `Sampler.sample` passes on.
 _SAMPLE_OUTPUTS = (
-    "contact_tokens",
+    "pair_tokens",
     "self_consistency",
     "reveal_t",
     "reveal_round",

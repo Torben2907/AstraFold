@@ -17,7 +17,7 @@ from astrafold.data import base_constants as rc
 from astrafold.data import rigid_utils
 from astrafold.data import utils as du
 from astrafold.data.all_atom import to_atom28_rna
-from astrafold.data.contacts import CONTACT, MASK, NO_CONTACT, unmask_tokens
+from astrafold.data.base_pairs import MASK, UNPAIRED
 from astrafold.data.nucleic_acid import to_pdb, write_structure
 from astrafold.data.sequence import (
     normalize_sequence,
@@ -192,50 +192,6 @@ def test_write_structure_rejects_unknown_format(tmp_path):
     assert not list(tmp_path.iterdir())
 
 
-# --- Token unmasking -------------------------------------------------------------
-
-
-def _confident_logits(values: torch.Tensor) -> torch.Tensor:
-    """Logits that put (almost) all probability on `values`."""
-    return torch.nn.functional.one_hot(values, num_classes=2).float() * 100
-
-
-def test_unmask_tokens_reveal_probability_extremes():
-    tokens = torch.tensor([[MASK, CONTACT, MASK, NO_CONTACT, MASK]])
-    predicted = torch.tensor([[1, 0, 0, 1, 1]])
-    logits = _confident_logits(predicted)
-
-    assert torch.equal(unmask_tokens(tokens, logits, reveal_probability=0.0), tokens)
-
-    revealed = unmask_tokens(tokens, logits, reveal_probability=1.0)
-    # Masked tokens take the predicted value, revealed ones keep theirs.
-    assert revealed.tolist() == [[1, CONTACT, 0, NO_CONTACT, 1]]
-
-
-def test_unmask_tokens_uses_the_given_noise():
-    tokens = torch.full((1, 4), MASK)
-    logits = torch.zeros(1, 4, 2)  # p(no contact) = p(contact) = 0.5
-    revealed = unmask_tokens(
-        tokens,
-        logits,
-        reveal_probability=0.5,
-        reveal_noise=torch.tensor([[0.1, 0.9, 0.4, 0.6]]),
-        value_noise=torch.tensor([[0.2, 0.2, 0.8, 0.8]]),
-    )
-    assert revealed.tolist() == [[NO_CONTACT, MASK, CONTACT, MASK]]
-
-
-def test_unmask_tokens_reveals_the_expected_fraction():
-    torch.manual_seed(0)
-    tokens = torch.full((1, 20_000), MASK)
-    logits = torch.tensor([0.0, np.log(3.0)]).expand(1, 20_000, 2)  # p(contact) = 0.75
-    revealed = unmask_tokens(tokens, logits, reveal_probability=0.3)
-
-    is_revealed = revealed != MASK
-    assert abs(is_revealed.float().mean() - 0.3) < 0.02
-    assert abs((revealed[is_revealed] == CONTACT).float().mean() - 0.75) < 0.03
-
-
 # --- Sampling --------------------------------------------------------------------
 
 
@@ -252,13 +208,21 @@ def _sample(flow_module: FlowModule, seeds: list[int], sequence: str = SEQUENCE)
     )
 
 
+def _assert_valid_secondary_structure(tokens: torch.Tensor) -> None:
+    """Every token revealed; pairs symmetric."""
+    assert torch.all((tokens == UNPAIRED) | (tokens >= 0))
+    for row in tokens:
+        paired = torch.nonzero(row >= 0).squeeze(-1)
+        assert torch.equal(row[row[paired]], paired)
+
+
 def test_sample_shapes(flow_module):
     sample = _sample(flow_module, seeds=[0, 1, 2])
     n = len(SEQUENCE)
     assert sample["trans"].shape == (3, n, 3)
     assert sample["rotmats"].shape == (3, n, 3, 3)
     assert sample["torsions"].shape == (3, n, 9, 2)
-    assert sample["contact_tokens"].shape == (3, n)
+    assert sample["pair_tokens"].shape == (3, n)
     for key, value in sample.items():
         assert torch.isfinite(value).all(), key
 
@@ -266,9 +230,7 @@ def test_sample_shapes(flow_module):
     identity = torch.eye(3).expand(3, n, 3, 3)
     rotmats = sample["rotmats"]
     assert torch.allclose(rotmats @ rotmats.transpose(-1, -2), identity, atol=1e-4)
-    assert torch.all(
-        (sample["contact_tokens"] == CONTACT) | (sample["contact_tokens"] == NO_CONTACT)
-    )
+    _assert_valid_secondary_structure(sample["pair_tokens"])
 
 
 def test_sample_goes_from_masked_to_revealed_tokens(flow_module):
@@ -276,7 +238,7 @@ def test_sample_goes_from_masked_to_revealed_tokens(flow_module):
     seen_t: list[float] = []
 
     def record(module, args):
-        seen_tokens.append(args[0]["contact_tokens"].clone())
+        seen_tokens.append(args[0]["pair_tokens"].clone())
         seen_t.append(args[0]["t"][0, 0].item())
 
     hook = flow_module.model.register_forward_pre_hook(record)
@@ -293,7 +255,7 @@ def test_sample_goes_from_masked_to_revealed_tokens(flow_module):
 
     assert torch.all(seen_tokens[0] == MASK)
     assert not torch.any(seen_tokens[-1] == MASK)
-    assert torch.equal(seen_tokens[-1], sample["contact_tokens"])
+    assert torch.equal(seen_tokens[-1], sample["pair_tokens"])
     for before, after in itertools.pairwise(seen_tokens):
         # A revealed token never changes again.
         was_revealed = before != MASK
@@ -315,7 +277,7 @@ def test_sample_does_not_depend_on_batch_composition(flow_module):
     alone = _sample(flow_module, seeds=[4])
     assert torch.allclose(batched["trans"][1], alone["trans"][0], atol=1e-2)
     assert torch.allclose(batched["rotmats"][1], alone["rotmats"][0], atol=1e-3)
-    assert torch.equal(batched["contact_tokens"][1], alone["contact_tokens"][0])
+    assert torch.equal(batched["pair_tokens"][1], alone["pair_tokens"][0])
 
 
 def test_sample_does_not_touch_the_global_rng(flow_module):
@@ -360,7 +322,7 @@ def test_sample_converges_to_a_perfect_prediction(flow_module):
             "pred_trans": x1_trans,
             "pred_rotmats": x1_rotmats,
             "pred_torsions": torch.zeros(1, n, 9, 2),
-            "token_logits": torch.zeros(1, n, 2),
+            "token_logits": torch.zeros(1, n, n + 1),
         }
 
     onehot = sequence_features(SEQUENCE)["onehot"]
@@ -420,7 +382,7 @@ def test_sampler_loads_checkpoint_in_eval_mode(checkpoint, flow_module):
     assert result["atom_positions"].shape == (2, n, 28, 3)
     assert result["atom_mask"].shape == (n, 28)
     assert result["aatype"].shape == (n,)
-    assert result["contact_tokens"].shape == (2, n)
+    assert result["pair_tokens"].shape == (2, n)
     assert np.isfinite(result["atom_positions"]).all()
 
 

@@ -4,7 +4,8 @@ Compares the flow and the hybrid sampler on held-out RNAs.
 Every RNA is sampled `--num-samples` times per sampler, with the same seeds (and
 therefore the same initial noise) for all samplers, and each sample is compared
 with the ground truth on the C1' atoms: RMSD, TM-score and lDDT, plus the accuracy
-of the generated contact tokens.
+of the generated base-pair tokens and the F1 score of the base pairs they form
+(against the base pairs annotated in the native structure).
 
 The RNAs come either from a metadata CSV of processed features (default: the
 RNA3DB validation split) or, with `--fasta` and `--natives`, from a FASTA file plus
@@ -45,7 +46,6 @@ from scipy.stats import spearmanr, wilcoxon
 
 from astrafold.config.hydra_schema import HybridSamplerConfig
 from astrafold.data import base_constants as rc
-from astrafold.data.contacts import make_contact_tokens
 from astrafold.data.nucleic_acid import write_structure
 from astrafold.data.pdb_na_dataset_base import PDBNABaseDataset
 from astrafold.inference import Sampler
@@ -64,6 +64,7 @@ COLUMNS = [
     "tm_score",
     "lddt",
     "token_accuracy",
+    "pair_f1",
     "rmsd_any",
     "tm_score_any",
     "lddt_any",
@@ -90,7 +91,7 @@ class Example:
     name: str
     sequence: str
     natives: list[tuple[np.ndarray, np.ndarray]]  # ([N, 3], [N] bool), primary first
-    tokens: np.ndarray  # [N] contact tokens of the primary native
+    tokens: np.ndarray  # [N] base-pair tokens of the primary native
 
 
 def _csv_examples(dataset: PDBNABaseDataset, indices: list[int]) -> dict[int, Example]:
@@ -102,24 +103,17 @@ def _csv_examples(dataset: PDBNABaseDataset, indices: list[int]) -> dict[int, Ex
             sequence="".join(rc.restypes[a] for a in example["aatype"].tolist()),
             # The backbone frame origins (trans_1) are the C1' atoms, so these are
             # the same atoms as the scored predictions and the FASTA natives.
-            natives=[
-                (example["trans_1"].numpy(), example["res_mask"].bool().numpy())
-            ],
-            tokens=example["contact_tokens"].numpy(),
+            natives=[(example["trans_1"].numpy(), example["res_mask"].bool().numpy())],
+            tokens=example["pair_tokens"].numpy(),
         )
     return examples
 
 
-def _native_examples(fasta: str, natives_dir: str, data_cfg) -> list[Example]:
+def _native_examples(fasta: str, natives_dir: str) -> list[Example]:
     examples = []
     for target in load_targets(fasta, natives_dir):
         primary = target.natives[0]
-        tokens = make_contact_tokens(
-            torch.from_numpy(primary.c1),
-            torch.from_numpy(primary.mask),
-            data_cfg.contact_distance_threshold,
-            data_cfg.contact_minimum_sequence_separation,
-        ).numpy()
+        tokens = primary.pair_tokens
         examples.append(
             Example(
                 target.name,
@@ -151,6 +145,19 @@ def _assign_shards(units: list[tuple[int, str, int]], num_shards: int, args):
         loads[shard] += _cost(unit[2], unit[1], args)
         shard_of[unit[:2]] = shard
     return shard_of
+
+
+def _pairs(tokens: np.ndarray, mask: np.ndarray) -> set[tuple[int, int]]:
+    i = np.flatnonzero((tokens > np.arange(len(tokens))) & mask)
+    return {(a, tokens[a]) for a in i if mask[tokens[a]]}
+
+
+def _pair_f1(pred: np.ndarray, native: np.ndarray, mask: np.ndarray) -> float:
+    """F1 score of the predicted base pairs (on the resolved nucleotides)."""
+    p, n = _pairs(pred, mask), _pairs(native, mask)
+    if not p and not n:
+        return 1.0
+    return 2 * len(p & n) / (len(p) + len(n))
 
 
 def _score(pred: np.ndarray, gt: np.ndarray, mask: np.ndarray) -> tuple:
@@ -223,9 +230,7 @@ def run(args) -> None:
 
     # Work units: (example, sampler) pairs of this shard, in example order.
     if args.fasta is not None:
-        examples = dict(
-            enumerate(_native_examples(args.fasta, args.natives, data_cfg))
-        )
+        examples = dict(enumerate(_native_examples(args.fasta, args.natives)))
         units = [
             (i, name, len(ex.sequence))
             for i, ex in examples.items()
@@ -272,7 +277,7 @@ def run(args) -> None:
 
             for j, seed in enumerate(seeds):
                 scores = [_score(pred[j], gt, mask) for gt, mask in ex.natives]
-                tokens = result["contact_tokens"][j]
+                tokens = result["pair_tokens"][j]
                 row = {
                     "pdb_name": ex.name,
                     "length": n,
@@ -282,6 +287,7 @@ def run(args) -> None:
                     "tm_score": scores[0][1],
                     "lddt": scores[0][2],
                     "token_accuracy": (tokens == ex.tokens)[primary_mask].mean(),
+                    "pair_f1": _pair_f1(tokens, ex.tokens, primary_mask),
                     "rmsd_any": min(s[0] for s in scores),
                     "tm_score_any": max(s[1] for s in scores),
                     "lddt_any": max(s[2] for s in scores),
@@ -371,6 +377,8 @@ def summarize(args) -> None:
     if not shards:
         raise SystemExit(f"No samples_*.csv in {out}; run the `run` step first")
     df = pd.concat(pd.read_csv(p) for p in shards)
+    if "pair_f1" not in df:  # results of the contact-token models
+        df["pair_f1"] = np.nan
     samplers = list(dict.fromkeys(df.sampler))
     # Only RNAs that every sampler has finished are compared.
     complete = df.groupby("pdb_name").sampler.nunique() == len(samplers)
@@ -392,16 +400,16 @@ def summarize(args) -> None:
         "",
         (
             "| Sampler | RMSD (Å) ↓ | best-of-K RMSD ↓ | TM-score ↑ | best-of-K TM ↑ "
-            "| lDDT ↑ | token acc. ↑ | top-1 TM by score ↑ | s / sample "
+            "| lDDT ↑ | token acc. ↑ | pair F1 ↑ | top-1 TM by score ↑ | s / sample "
             "| calls / sample | forced |"
         ),
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     per_rna = {}
     for name in samplers:
         d = df[df.sampler == name]
         g = d.groupby("pdb_name")
-        mean = g[["rmsd", "tm_score", "lddt", "token_accuracy"]].mean()
+        mean = g[["rmsd", "tm_score", "lddt", "token_accuracy", "pair_f1"]].mean()
         per_rna[name] = mean
         best_rmsd, best_tm = g.rmsd.min(), g.tm_score.max()
         if d.self_consistency.notna().all():
@@ -416,7 +424,7 @@ def summarize(args) -> None:
         lines.append(
             f"| {name} | {cell(mean.rmsd)} | {cell(best_rmsd)} | {cell(mean.tm_score)} "
             f"| {cell(best_tm)} | {cell(mean.lddt)} | {cell(mean.token_accuracy)} "
-            f"| {top1_str} | {_fmt(d.seconds.mean())} "
+            f"| {cell(mean.pair_f1)} | {top1_str} | {_fmt(d.seconds.mean())} "
             f"| {_fmt(d.num_model_calls.mean()) if d.num_model_calls.notna().any() else '50'} "
             f"| {_fmt(d.num_forced.mean()) if d.num_forced.notna().any() else '–'} |"
         )

@@ -22,8 +22,12 @@ class EdgeEmbedder(nn.Module):
         self.linear_s_p = nn.Linear(self.c_s, self.feat_dim)
         self.linear_relpos = nn.Linear(self.feat_dim, self.feat_dim)
 
-        # Both nodes' features (2 * feat_dim) + relative position (feat_dim)
-        total_edge_feats = self.feat_dim * 3
+        # Revealed base pairs: 1 where i and j are a revealed pair.
+        self.pair_token_embedding = nn.Embedding(2, self.feat_dim)
+
+        # Both nodes' features (2 * feat_dim), relative position (feat_dim) and the
+        # revealed base pairs (feat_dim)
+        total_edge_feats = self.feat_dim * 4
 
         self.edge_embedder = nn.Sequential(
             nn.Linear(total_edge_feats, self.c_p),
@@ -52,13 +56,14 @@ class EdgeEmbedder(nn.Module):
             .reshape([num_batch, num_res, num_res, -1])
         )
 
-    def forward(self, s, t, sc_t, p_mask):
+    def forward(self, s, t, sc_t, p_mask, pairs):
         """
         Params:
             s      : [B, N, c_s] node embeddings
             t      : [B, N, 3] noisy translations (currently unused)
             sc_t   : [B, N, 3] self-conditioning translations (currently unused)
             p_mask : [B, N, N] pair mask
+            pairs  : [B, N, N] True where i and j are a revealed base pair
 
         Returns:
             [B, N, N, c_p] edge embeddings
@@ -73,7 +78,11 @@ class EdgeEmbedder(nn.Module):
 
         relpos_feats = self.embed_relpos(pos)
 
-        all_edge_feats = torch.concat([cross_node_feats, relpos_feats], dim=-1)
+        pair_feats = self.pair_token_embedding(pairs.long())
+
+        all_edge_feats = torch.concat(
+            [cross_node_feats, relpos_feats, pair_feats], dim=-1
+        )
 
         edge_feats = self.edge_embedder(all_edge_feats)
         edge_feats *= p_mask.unsqueeze(-1)

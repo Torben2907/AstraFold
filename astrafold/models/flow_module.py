@@ -17,7 +17,7 @@ from torch import Tensor
 
 from astrafold.config.hydra_schema import HydraConfig
 from astrafold.data import so3_utils
-from astrafold.data.contacts import random_mask_tokens
+from astrafold.data.base_pairs import random_mask_tokens, token_targets
 from astrafold.data.interpolant import Interpolant
 from astrafold.metrics import kabsch_rmsd
 from astrafold.models.flow_model import FlowModel
@@ -42,24 +42,24 @@ class FlowModule(LightningModule):
     ) -> dict[str, Tensor]:
         """
         Builds the model input for a clean batch: noises the frames to flow time `t`
-        (sampled uniformly if None) and masks a random subset of the contact tokens.
+        (sampled uniformly if None) and masks a random subset of the base-pair tokens.
 
         On top of the interpolant's output, the returned batch holds:
-            contact_tokens   : the partially masked tokens (model input)
-            contact_tokens_1 : the clean tokens (prediction target)
-            token_mask       : True where a token was masked
+            pair_tokens   : the partially masked tokens (model input)
+            pair_tokens_1 : the clean tokens (prediction target)
+            token_mask    : True where a token was masked
         """
         self.interpolant.set_device(batch["res_mask"].device)
         noisy_batch = self.interpolant.corrupt_batch(batch, t=t)
 
-        tokens = noisy_batch["contact_tokens"]
+        tokens = noisy_batch["pair_tokens"]
         masked_tokens, token_mask = random_mask_tokens(
             tokens,
             noisy_batch["res_mask"],
             mask_probability=self._exp_cfg.training.token_mask_probability,
         )
-        noisy_batch["contact_tokens_1"] = tokens
-        noisy_batch["contact_tokens"] = masked_tokens
+        noisy_batch["pair_tokens_1"] = tokens
+        noisy_batch["pair_tokens"] = masked_tokens
         noisy_batch["token_mask"] = token_mask
         return noisy_batch
 
@@ -92,7 +92,7 @@ class FlowModule(LightningModule):
         gt_trans_1 = noisy_batch["trans_1"]
         gt_rotmats_1 = noisy_batch["rotmats_1"]
         gt_torsions_1 = noisy_batch["torsion_angles_sin_cos"][:, :, :NUM_TORSIONS, :]
-        gt_tokens = noisy_batch["contact_tokens_1"]
+        gt_tokens = token_targets(noisy_batch["pair_tokens_1"])
         token_mask = noisy_batch["token_mask"]
         rotmats_t = noisy_batch["rotmats_t"]
         gt_rot_vf = so3_utils.calc_rot_vf(rotmats_t, gt_rotmats_1.type(torch.float32))
@@ -129,8 +129,11 @@ class FlowModule(LightningModule):
             / (num_frames * 3)
         )
 
-        # Contact token loss and accuracy, on the masked tokens only
-        token_loss = F.cross_entropy(token_logits[token_mask], gt_tokens[token_mask])
+        # Base-pair token loss and accuracy, on the masked tokens only: the token
+        # of nucleotide i is a class among its N partners and "unpaired".
+        token_loss = F.cross_entropy(
+            token_logits[token_mask].float(), gt_tokens[token_mask]
+        )
         with torch.no_grad():
             pred_tokens = token_logits.argmax(dim=-1)
             token_accuracy = (

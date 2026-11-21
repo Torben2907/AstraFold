@@ -1,7 +1,7 @@
 """
-Hybrid sampler: synchronizes the discrete contact tokens with the continuous flow.
+Hybrid sampler: synchronizes the discrete base-pair tokens with the continuous flow.
 
-The tokens are revealed one at a time (most confident first), and every reveal
+The tokens are revealed a few at a time (most confident first), and every reveal
 restarts the continuous flow from the *same* initial noise:
 
     (x_init, c)   --flow-->  until a masked token is confident  --> reveal it: c'
@@ -10,7 +10,7 @@ restarts the continuous flow from the *same* initial noise:
     (x_init, c_full) --flow--> t = 1: the final structure x_end
 
 Early in a trajectory the structure is a superposition of possible solutions; the
-flow is followed only until the model is sure about one contact token. The final
+flow is followed only until the model is sure about one base-pair token. The final
 trajectory, conditioned on all tokens, should then be close to a straight
 ("noising") path, i.e. easy to integrate.
 
@@ -27,6 +27,7 @@ Pseudocode (flow time t runs from min_t = noise to 1 = data in this code base):
     5      WHILE max_{i masked, k} P_i(k | x(t), c, t) < 1 - eps   (and t < 1)
     6          x(t + dt) <- Euler step towards x1_hat(x(t), c, t)
     7-8    reveal c_i <- argmax_k P_i(k | ...) for the most confident masked i
+           (k: a partner j that is still masked, or unpaired; c_j <- i as well)
        integrate (x_init, c) from min_t to 1                       -> x_end
     9  c_re <- remask(c)
     10 score <- sum_{i remasked} log P_i(k = c_i | x_end, c_re, t = 1)
@@ -38,7 +39,12 @@ import math
 import torch
 from torch import Tensor
 
-from astrafold.data.contacts import MASK
+from astrafold.data.base_pairs import (
+    MASK,
+    available_options,
+    reveal_tokens,
+    token_targets,
+)
 from astrafold.data.interpolant import Interpolant, draw_per_sample, seeded_generators
 
 
@@ -82,7 +88,7 @@ def sample_hybrid(
         trans            : [B, N, 3] frame origins (in Angstrom) of x_end
         rotmats          : [B, N, 3, 3] frame orientations of x_end
         torsions         : [B, N, 9, 2] torsion angles as (sin, cos)
-        contact_tokens   : [B, N] the generated contact tokens
+        pair_tokens      : [B, N] the generated base-pair tokens
         self_consistency : [B] the self-consistency score (<= 0, higher is better)
         remask           : [B, N] True where a token was remasked for the score
         reveal_t         : [B, N] flow time at which each token was revealed
@@ -119,7 +125,7 @@ def sample_hybrid(
             "onehot": onehot[None].expand(len(idx), -1, -1),
             "trans_t": trans_t,
             "rotmats_t": rotmats_t,
-            "contact_tokens": tokens,
+            "pair_tokens": tokens,
             "t": t[:, None],
         }
         if self_condition:
@@ -153,9 +159,10 @@ def sample_hybrid(
         )
         num_model_calls[active] += 1
 
-        # Line 5: the confidence max_k P_i(k | x(t), c, t) of every masked token.
+        # Line 5: the confidence max_k P_i(k | x(t), c, t) of every masked token,
+        # over the values it can still take (a masked partner, or unpaired).
         probs = torch.softmax(out["token_logits"].float(), dim=-1)
-        confidence, value = probs.max(dim=-1)  # [A, N]
+        confidence = (probs * available_options(a_tokens)).max(dim=-1).values
         masked = a_tokens == MASK
         confidence = confidence.masked_fill(~masked, -1.0)
         best_confidence = confidence.max(dim=-1).values
@@ -163,15 +170,18 @@ def sample_hybrid(
         reveal = confident | (a_step == last_step)  # [A]
 
         # Lines 7-8: reveal the most confident masked token (rank 0), plus further
-        # tokens above the threshold if tokens_per_round > 1.
+        # tokens above the threshold if tokens_per_round > 1. A revealed pair also
+        # reveals the partner's token.
         rank = confidence.argsort(dim=-1, descending=True).argsort(dim=-1)
         chosen = (rank == 0) | ((rank < tokens_per_round) & (confidence >= threshold))
         chosen &= masked & reveal[:, None]
 
-        tokens[active] = torch.where(chosen, value, a_tokens)
-        reveal_t[active] = torch.where(chosen, a_t[:, None], reveal_t[active])
+        new_tokens = reveal_tokens(a_tokens, probs, chosen, priority=confidence)
+        changed = new_tokens != a_tokens
+        tokens[active] = new_tokens
+        reveal_t[active] = torch.where(changed, a_t[:, None], reveal_t[active])
         reveal_round[active] = torch.where(
-            chosen, rounds[active][:, None], reveal_round[active]
+            changed, rounds[active][:, None], reveal_round[active]
         )
         num_forced[active] += (reveal & ~confident).long()
         rounds[active] += reveal.long()
@@ -231,14 +241,15 @@ def sample_hybrid(
     )
     num_model_calls += 1
     log_probs = torch.log_softmax(scored["token_logits"].float(), dim=-1)
-    token_log_probs = log_probs.gather(-1, tokens[..., None]).squeeze(-1)
+    targets = token_targets(tokens)
+    token_log_probs = log_probs.gather(-1, targets[..., None]).squeeze(-1)
     self_consistency = (token_log_probs * remask).sum(dim=-1)
 
     return {
         "trans": final["pred_trans"],
         "rotmats": final["pred_rotmats"],
         "torsions": final["pred_torsions"].reshape(num_batch, num_res, -1, 2),
-        "contact_tokens": tokens,
+        "pair_tokens": tokens,
         "self_consistency": self_consistency,
         "remask": remask,
         "reveal_t": reveal_t,

@@ -15,9 +15,10 @@ from beartype.typing import Optional
 from torch.utils.data import Dataset
 
 from astrafold.config.hydra_schema import DataConfig
+from astrafold.data import base_constants as rc
 from astrafold.data import rigid_utils
 from astrafold.data import utils as du
-from astrafold.data.contacts import make_contact_tokens
+from astrafold.data.base_pairs import UNPAIRED, annotate_base_pairs
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -29,7 +30,7 @@ class PDBNABaseDataset(Dataset):
         pkls/<pdb_name>_base/<pdb_name>_feat.pkl     : frames and torsion angles
 
     Params:
-        data_conf   : data config (length filters, contact token settings)
+        data_conf   : data config (length filters, batch sizes)
         is_training : only labels the log message
         csv_path    : metadata CSV to read; defaults to `data_conf.csv_path`
     """
@@ -89,11 +90,19 @@ class PDBNABaseDataset(Dataset):
         ]
         trans_1 = rigids_1.get_trans()
 
-        contact_tokens = make_contact_tokens(
-            trans_1,
-            bb_mask.bool(),
-            distance_threshold=self._data_conf.contact_distance_threshold,
-            min_sequence_separation=self._data_conf.contact_minimum_sequence_separation,
+        # Base pairs of the native structure; pairs with a residue outside the
+        # backbone mask are dropped, so both ends of a pair are always valid.
+        sequence = "".join(rc.restypes[a] for a in np.asarray(nufeat["aatype"]))
+        pair_tokens = annotate_base_pairs(
+            sequence,
+            np.asarray(nufeat["all_atom_positions"], dtype=np.float32),
+            np.asarray(nufeat["all_atom_mask"]).astype(bool),
+        )
+        valid = bb_mask.bool().numpy()
+        is_paired = pair_tokens >= 0
+        keep = valid & is_paired & valid[np.where(is_paired, pair_tokens, 0)]
+        pair_tokens = torch.from_numpy(
+            np.where(keep | ~is_paired, pair_tokens, UNPAIRED)
         )
 
         return {
@@ -106,7 +115,7 @@ class PDBNABaseDataset(Dataset):
             "trans_1": trans_1,  # [N, 3] frame origins (in Angstrom)
             "rotmats_1": rigids_1.get_rots().get_rot_mats(),  # [N, 3, 3]
             "torsion_angles_sin_cos": nufeat["torsion_angles_sin_cos"],
-            "contact_tokens": contact_tokens,  # [N] 1 = has a contact, 0 = has none
+            "pair_tokens": pair_tokens,  # [N] partner index, or UNPAIRED (-1)
         }
 
     @staticmethod
